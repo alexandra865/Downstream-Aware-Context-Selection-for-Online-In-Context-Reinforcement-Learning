@@ -1,0 +1,4 @@
+# Runtime source hashes require exact Python file bytes.
+*.py -text
+
+*.ttf binary

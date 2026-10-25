@@ -1,0 +1,316 @@
+import time
+
+from trafficManager.common.observation import Observation
+from trafficManager.common.vehicle import Behaviour, Vehicle
+from trafficManager.planner.abstract_planner import AbstractEgoPlanner
+from trafficManager.predictor.abstract_predictor import Prediction
+
+import logger, logging
+from utils.obstacles import DynamicObstacle, ObsType, Rectangle
+from utils.roadgraph import JunctionLane, NormalLane, RoadGraph, AbstractLane
+from utils.trajectory import State, Trajectory
+
+import numpy as np
+import math
+
+from trafficManager.planner.frenet_optimal_planner import frenet_optimal_planner
+from trafficManager.common import cost
+decision_logger = logger.setup_app_level_logger(logger_name="ego_planner", file_name="llm_decision.log")
+logging = logging.getLogger("ego_planner").getChild(__name__)
+
+class LLMEgoPlanner(AbstractEgoPlanner):
+    def plan(self,
+             ego_veh: Vehicle,
+             observation: Observation,
+             roadgraph: RoadGraph,
+             prediction: Prediction,
+             T,
+             config) -> Trajectory:
+        logging.info("============= planning at {} s =============".format(T))
+        vehicle_id = ego_veh.id
+        start = time.time()
+        current_lane = roadgraph.get_lane_by_id(ego_veh.lane_id)
+        obs_list = []
+        # Process static obstacle
+        for obs in observation.obstacles:
+            obs_list.append(obs)
+
+        # Process dynamic_obstacles
+        for predict_veh, prediction in prediction.results.items():
+            if predict_veh.id == vehicle_id:
+                continue
+            if not prediction:
+                raise RuntimeError(
+                    "Predictor returned an empty trajectory for vehicle "
+                    f"{predict_veh.id}"
+                )
+
+            shape = Rectangle(predict_veh.length, predict_veh.width)
+            current_state = State(x=prediction[0].x,
+                                  y=prediction[0].y,
+                                  s=prediction[0].s,
+                                  d=prediction[0].d,
+                                  yaw=prediction[0].yaw,
+                                  vel=prediction[0].vel)
+            dynamic_obs = DynamicObstacle(obstacle_id=predict_veh.id,
+                                          shape=shape,
+                                          obstacle_type=ObsType.CAR,
+                                          current_state=current_state,
+                                          lane_id=predict_veh.lane_id)
+            for i in range(1, len(prediction)):
+                state = State(x=prediction[i].x,
+                              y=prediction[i].y,
+                              s=prediction[i].s,
+                              d=prediction[i].d,
+                              yaw=prediction[i].yaw,
+                              vel=prediction[i].vel)
+                dynamic_obs.future_trajectory.states.append(state)
+
+            obs_list.append(dynamic_obs)
+
+        """
+        Predict for current vehicle
+        """
+        next_lane = roadgraph.get_available_next_lane(
+            current_lane.id, ego_veh.available_lanes)
+        lanes = [current_lane, next_lane] if next_lane != None else [
+            current_lane]
+
+        if ego_veh.behaviour == Behaviour.IDLE:
+            path = self.acdc_trajectory_generator(ego_veh, lanes, config, ego_veh.behaviour)
+        elif ego_veh.behaviour == Behaviour.AC:
+            # Accelerate
+            path = self.acdc_trajectory_generator(ego_veh, lanes, config, ego_veh.behaviour)
+        elif ego_veh.behaviour == Behaviour.DC:
+            # Decelerate
+            path = self.acdc_trajectory_generator(ego_veh, lanes, config, ego_veh.behaviour)
+        elif ego_veh.behaviour == Behaviour.LCL:
+            # Turn Left. JunctionLane may not expose left_lane(); in that case,
+            # lane change is geometrically invalid, so fall back to current-lane
+            # trajectory generation instead of crashing the episode.
+            left_lane_fn = getattr(current_lane, "left_lane", None)
+            left_lane_id = left_lane_fn() if callable(left_lane_fn) else None
+            left_lane = roadgraph.get_lane_by_id(left_lane_id) if left_lane_id is not None else None
+            if left_lane is None:
+                logging.warning(
+                    "Vehicle %s requested LCL from lane %s (%s), but no left lane is available; "
+                    "falling back to current-lane IDLE trajectory.",
+                    ego_veh.id,
+                    getattr(current_lane, "id", None),
+                    type(current_lane).__name__,
+                )
+                path = self.acdc_trajectory_generator(ego_veh, lanes, config, Behaviour.IDLE)
+            else:
+                path = self.lanechange_trajectory_generator(
+                    ego_veh,
+                    left_lane,
+                    obs_list,
+                    config,
+                    T,
+                )
+        elif ego_veh.behaviour == Behaviour.LCR:
+            # Turn Right. JunctionLane may not expose right_lane(); in that case,
+            # lane change is geometrically invalid, so fall back to current-lane
+            # trajectory generation instead of crashing the episode.
+            right_lane_fn = getattr(current_lane, "right_lane", None)
+            right_lane_id = right_lane_fn() if callable(right_lane_fn) else None
+            right_lane = roadgraph.get_lane_by_id(right_lane_id) if right_lane_id is not None else None
+            if right_lane is None:
+                logging.warning(
+                    "Vehicle %s requested LCR from lane %s (%s), but no right lane is available; "
+                    "falling back to current-lane IDLE trajectory.",
+                    ego_veh.id,
+                    getattr(current_lane, "id", None),
+                    type(current_lane).__name__,
+                )
+                path = self.acdc_trajectory_generator(ego_veh, lanes, config, Behaviour.IDLE)
+            else:
+                path = self.lanechange_trajectory_generator(
+                    ego_veh,
+                    right_lane,
+                    obs_list,
+                    config,
+                    T,
+                )
+        else:
+            logging.error(
+                "Vehicle {} has unknown behaviour {}".format(
+                    ego_veh.id, ego_veh.behaviour)
+            )
+        logging.debug(
+            "Vehicle {} Total planning time: {}".format(
+                ego_veh.id, time.time() - start)
+        )
+
+        return path
+
+    def acdc_trajectory_generator(self, 
+        vehicle: Vehicle, 
+        lanes: AbstractLane, 
+        config, 
+        behaviour:Behaviour
+    ) -> Trajectory:
+        
+        course_t = config["MIN_T"]  # Sample course time
+        dt = config["DT"]  # time tick
+        current_state = vehicle.current_state
+        
+        if behaviour == Behaviour.AC:
+            if current_state.acc < 0:
+                target_acc = config["NORMAL_ACC_DEFAULT"]
+            else:
+                target_acc = current_state.acc + config["NORMAL_ACC_DEFAULT"]
+            if target_acc > config["ACC_MAX"]:
+                target_acc = config["ACC_MAX"]
+
+        elif behaviour == Behaviour.DC:
+            if current_state.acc > 0:
+                target_acc = -config["NORMAL_DCC_DEFAULT"]
+            else:
+                target_acc = current_state.acc -config["NORMAL_DCC_DEFAULT"]
+            if target_acc < config["ACC_MIN"]:
+                target_acc = config["ACC_MIN"]
+            # 需要计算如果减速结果为负数的时候，那么到零为止，后面就直接停车
+            if current_state.vel + target_acc*course_t < 0:
+                course_t = (0.1 - current_state.vel)/target_acc
+
+        elif behaviour == Behaviour.IDLE:
+            target_acc = 0
+
+        target_v = current_state.vel + target_acc*course_t
+        target_s = current_state.s + (current_state.vel + target_v)* course_t * 0.5
+        if target_s - current_state.s < vehicle.length:
+            target_state = State(s=target_s, s_d=target_v, d=current_state.d)
+        else:
+            target_state = State(s=target_s, s_d=target_v, d=0)
+
+        # judge stopping the car
+        if (round(current_state.vel, 1) <= 0.1 and
+            (target_s - current_state.s) <= vehicle.length):  # already stopped, keep it
+            logging.debug(f"Vehicle {vehicle.id} Already stopped")
+            path = Trajectory()
+            for t in np.arange(0, config["MIN_T"], dt):
+                path.states.append(
+                    State(t=t, s=current_state.s, d=current_state.d, yaw=None))
+            path.frenet_to_cartesian(lanes, vehicle.current_state)
+            path.cost = (
+                cost.smoothness(path, lanes[0].course_spline, config["weights"]) *
+                dt + cost.guidance(path, config["weights"]) * dt +
+                cost.acc(path, config["weights"]) * dt +
+                cost.jerk(path, config["weights"]) * dt)
+        else:
+            path = frenet_optimal_planner.calc_spec_path(current_state,
+                                                        target_state, course_t, dt
+                                                        )
+            
+            if course_t != config["MIN_T"]:
+                logging.debug(f"course_t is {course_t}, dt is {dt}, path length is {len(path.states)}, yaw is {path.states[-1].yaw}, current yaw is {current_state.yaw}")
+                for t in np.arange(path.states[-1].t + dt, config["MIN_T"], dt):
+                    path.states.append(
+                        State(t=t, s=target_state.s, d=target_state.d, yaw=None))
+            path.frenet_to_cartesian(lanes, current_state)
+            path.cost = (
+                cost.smoothness(path, lanes[0].course_spline, config["weights"]) *
+                dt + cost.guidance(path, config["weights"]) * dt +
+                cost.acc(path, config["weights"]) * dt +
+                cost.jerk(path, config["weights"]) * dt)
+        return path
+
+    def lanechange_trajectory_generator(self,
+        vehicle: Vehicle,
+        target_lane: AbstractLane,
+        obs_list,
+        config,
+        T,
+    ) -> Trajectory:
+        
+        state_in_target_lane = vehicle.get_state_in_lane(target_lane)
+        target_vel = vehicle.current_state.vel
+        dt = config["DT"]
+        s_sample = config["S_SAMPLE"]
+        n_s_sample = config["N_S_SAMPLE"]
+
+        sample_t = [config["MIN_T"] / 2.0]  # Sample course time
+        vel = min(state_in_target_lane.vel, target_vel)
+        sample_s = np.empty(0)
+        for t in sample_t:
+            sample_s = np.append(
+                sample_s,
+                np.arange(
+                    state_in_target_lane.s + t * vel,
+                    state_in_target_lane.s + t *
+                    (target_vel + s_sample * n_s_sample * 1.01),
+                    s_sample,
+                ),
+            )
+
+        # Step 2: Calculate Paths
+        best_path = None
+        best_cost = math.inf
+        for t in sample_t:
+            for s in sample_s:
+                s_d = vehicle.current_state.vel
+                target_state = State(t=t, s=s, d=0, s_d=s_d)
+                path = frenet_optimal_planner.calc_spec_path(
+                    state_in_target_lane, target_state, target_state.t, dt)
+                if not path.states:
+                    continue
+                path.frenet_to_cartesian(target_lane, vehicle.current_state)
+                path.cost = (
+                    cost.smoothness(path, target_lane.course_spline,
+                                    config["weights"]) * dt +
+                    cost.vel_diff(path, target_vel, config["weights"]) * dt +
+                    cost.guidance(path, config["weights"]) * dt +
+                    cost.acc(path, config["weights"]) * dt +
+                    cost.jerk(path, config["weights"]) * dt +
+                    cost.obs(vehicle, path, obs_list, config) +
+                    cost.changelane(config["weights"]))
+                if not path.is_nonholonomic():
+                    continue
+                if path.cost < best_cost:
+                    best_cost = path.cost
+                    best_path = path
+        if best_path is not None:
+            logging.debug(f"Vehicle {vehicle.id} found a lane change path with cost: {best_cost}")
+            return best_path
+        else:
+            raise("can't generate the trajectory!")
+    
+    # def update_state(self, vehicle: Vehicle, roadgraph: RoadGraph) -> None:
+    #     """Update the behaviour of a vehicle.
+
+    #     Args:
+    #         roadgraph (RoadGraph): The roadgraph containing the lanes the vehicle is traveling on.
+    #     """
+    #     current_lane = roadgraph.get_lane_by_id(vehicle.lane_id)
+    #     # Lane change behavior
+    #     if isinstance(current_lane, NormalLane):
+    #         if vehicle.behaviour == Behaviour.LCL:
+    #             left_lane_id = current_lane.left_lane()
+    #             left_lane = roadgraph.get_lane_by_id(left_lane_id)
+    #             state = vehicle.get_state_in_lane(left_lane)
+    #             if state.d > -left_lane.width / 2:
+    #                 vehicle.change_to_lane(left_lane)
+
+    #         elif vehicle.behaviour == Behaviour.LCR:
+    #             right_lane_id = current_lane.right_lane()
+    #             right_lane = roadgraph.get_lane_by_id(right_lane_id)
+    #             state = vehicle.get_state_in_lane(right_lane)
+    #             if state.d < right_lane.width / 2:
+    #                 vehicle.change_to_lane(right_lane)
+    #     # Next lane
+    #     if vehicle.current_state.s > current_lane.course_spline.s[-1] - 0.2:
+    #         if isinstance(current_lane, NormalLane):
+    #             next_lane = roadgraph.get_available_next_lane(
+    #                 current_lane.id, vehicle.available_lanes)
+    #             vehicle.lane_id = next_lane.id
+    #             vehicle.current_state = vehicle.get_state_in_lane(next_lane)
+    #             current_lane = next_lane
+    #         elif isinstance(current_lane, JunctionLane):
+    #             next_lane_id = current_lane.next_lane_id
+    #             next_lane = roadgraph.get_lane_by_id(next_lane_id)
+    #             vehicle.lane_id = next_lane.id
+    #             vehicle.current_state = vehicle.get_state_in_lane(next_lane)
+    #             current_lane = next_lane
+
+    #     return
